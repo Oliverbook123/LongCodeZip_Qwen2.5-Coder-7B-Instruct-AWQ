@@ -9,6 +9,8 @@
 
 This repository is the official implementation of LongCodeZip, a novel two-stage long code compression method. Our paper "LongCodeZip: Compress Long Context for Code Language Models" has been accepted to **ASE 2025**.
 
+> This fork adds [`demo_awq.py`](demo_awq.py), a single-model AWQ demo for GPUs with limited VRAM. The original upstream repository is [YerbaPage/LongCodeZip](https://github.com/YerbaPage/LongCodeZip).
+
 ## Method Overview
 
 ![Overview](assets/overview.png)
@@ -26,20 +28,27 @@ The method is plug-and-play and can be integrated with existing code LLMs to ach
 You can install directly from the GitHub repository:
 
 ```bash
-pip install git+https://github.com/YerbaPage/LongCodeZip.git
+pip install git+https://github.com/Oliverbook123/LongCodeZip_Qwen2.5-Coder-7B-Instruct-AWQ.git
 ```
 
 Or clone and install in development mode:
 
 ```bash
-git clone https://github.com/YerbaPage/LongCodeZip.git
-cd LongCodeZip
+git clone https://github.com/Oliverbook123/LongCodeZip_Qwen2.5-Coder-7B-Instruct-AWQ.git
+cd LongCodeZip_Qwen2.5-Coder-7B-Instruct-AWQ
 pip install -e .
 ```
 
 ## Quick Demo
 
-We provide a simple demo (`demo.py`) to help you get started with LongCodeZip. 
+Two demos are provided:
+
+| Script | Compression model | Generation model | Notes |
+|---|---|---|---|
+| `demo.py` | `Qwen/Qwen2.5-Coder-7B-Instruct` | separate 7B model or OpenAI API | Loads two large models; needs ~30GB if both 7B models are local |
+| `demo_awq.py` | `Qwen/Qwen2.5-Coder-7B-Instruct-AWQ` | the same AWQ model | Reuses one model for both stages; suitable for 8GB GPUs |
+
+### Original Demo
 
 ```bash
 python demo.py
@@ -56,7 +65,56 @@ To use an OpenAI API instead of an open source model, add the `--use_openai` fla
 ```bash
 python demo.py --use_openai --generation_model gpt-4o
 ```
-It is recommended to set your API key as an environment variable. For example, create a `.env` file and add: `OPENAI_API_KEY="enter_ your_key_here"`
+It is recommended to set your API key as an environment variable. For example, create a `.env` file and add: `OPENAI_API_KEY="enter_ your_key_here"`. The OpenAI path also requires `pip install python-dotenv`.
+
+### Single-Model AWQ Demo (8GB-friendly)
+
+`demo.py` keeps the compression model and the generation model in VRAM at the same time. On a small GPU, loading two 7B models is usually impossible. `demo_awq.py` avoids this by using `Qwen/Qwen2.5-Coder-7B-Instruct-AWQ` for **both compression and generation**:
+
+- one AWQ model instance is shared by both stages;
+- both compression modes run before generation;
+- the internal 0.5B entropy model is freed after compression;
+- generation reuses the already-loaded AWQ model instead of loading a second 7B model.
+
+Install the AWQ runtime:
+
+```bash
+pip install autoawq
+```
+
+Run:
+
+```bash
+python demo_awq.py
+```
+
+Useful options:
+
+```bash
+python demo_awq.py --device_map auto
+python demo_awq.py --max_new_tokens 64
+python demo_awq.py --model Qwen/Qwen2.5-Coder-0.5B-Instruct  # test without autoawq
+```
+
+You can also use the AWQ model directly through the library:
+
+```python
+import torch
+from longcodezip import LongCodeZip
+
+compressor = LongCodeZip(
+    model_name="Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
+    model_config={"torch_dtype": torch.float16},
+)
+```
+
+**Memory notes:**
+
+- The AWQ checkpoint is about 5.6GB. Together with the 0.5B entropy model, the demo uses roughly 6.6GB before compression activations.
+- 8GB is tight: short code files can work, but very long functions may still run out of memory.
+- `--device_map auto` may offload some layers to CPU and is slower.
+- The entropy chunking model remains `Qwen/Qwen2.5-Coder-0.5B-Instruct`; only the main compression/generation model is AWQ.
+- `autoawq` is distributed mainly as a source package. If it cannot be installed for your torch/CUDA version, test the demo with `--model Qwen/Qwen2.5-Coder-0.5B-Instruct`.
 
 ## Basic Example
 

@@ -180,3 +180,6 @@ old_scripts/
 *.tar.zstd
 *.tar.lz
 *.html
+
+# Local agent instructions
+AGENTS.md
