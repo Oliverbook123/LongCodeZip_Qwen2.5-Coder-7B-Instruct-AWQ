@@ -183,3 +183,6 @@ old_scripts/
 
 # Local agent instructions
 AGENTS.md
+
+# experience
+experiments/long-code-completion/results

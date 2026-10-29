@@ -16,3 +16,7 @@ tree-sitter==0.21.3
 tree-sitter-languages
 tempdir
 wget
+
+# Experiment dependencies
+llmlingua
+vllm==0.10.2
