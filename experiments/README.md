@@ -35,3 +35,16 @@ Navigate to the `long-code-completion` directory:
 cd long-code-completion
 bash run.sh
 ```
+
+#### Fine-grained budget comparison
+
+The experiment-2 runner evaluates the same fixed 500 samples with the
+historical line-weighted allocation and the token-weighted allocation:
+
+```bash
+bash run_budget_comparison.sh
+```
+
+Results are written to `results/exp2-line` and `results/exp2-token`, followed
+by a per-metric comparison. Use `--fine-budget-mode line` or
+`--fine-budget-mode token` when running `staged_awq.py` manually.

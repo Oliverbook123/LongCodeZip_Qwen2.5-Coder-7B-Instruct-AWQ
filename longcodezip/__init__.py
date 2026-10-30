@@ -11,6 +11,7 @@ import copy
 import bisect
 import json
 from loguru import logger
+from .budget import allocate_fine_grained_ratios
 import sys
 # set the level to info only, no need to show the debug messages
 logger.remove()
@@ -616,6 +617,7 @@ class LongCodeZip:
         importance_beta: float = 0.5,
         use_knapsack: bool = True,
         repeat_instruction_at_end: bool = True,
+        fine_budget_mode: str = "line",
     ):
         """
         Compress a code file by first splitting it into function-based chunks and then compressing.
@@ -637,6 +639,7 @@ class LongCodeZip:
             importance_beta: Controls how much function importance affects its individual compression rate during fine-grained compression.
             use_knapsack: Whether to use knapsack algorithm for block selection (True) or greedy line-by-line approach (False).
             repeat_instruction_at_end: Whether to repeat instruction at the end of the prompt
+            fine_budget_mode: Fine-grained budget allocation mode ("line" or "token")
             
         Returns:
             Compressed code and statistics with the following structure:
@@ -808,113 +811,43 @@ class LongCodeZip:
                     lines = chunk.split("\n")
                     line_count = len(lines)
                     score = importance_map.get(i, 0.0) # Default score 0 if not found
+                    token_count = self.get_token_length(chunk)
                     selected_functions_data.append({
                         "index": i,
                         "lines": lines,
                         "line_count": line_count,
-                        "score": score
+                        "token_count": token_count,
+                        "score": score,
                     })
                     total_lines_selected += line_count
                 else:
                      logger.warning(f"Selected index {i} is out of bounds for code_chunks (length {len(code_chunks)})")
 
 
-            # 2. Calculate overall fine-grained target lines
+            if fine_budget_mode not in {"line", "token"}:
+                raise ValueError(
+                    f"Unsupported fine_budget_mode: {fine_budget_mode}; expected 'line' or 'token'"
+                )
+
+            # 2. Calculate overall fine-grained target
             current_fine_ratio = fine_ratio if fine_ratio is not None else rate # Use rate if fine_ratio not set
-            if original_target_token > 0: # If target_token was set explicitly, derive ratio from it for fine-grained stage
-                 # Estimate target lines based on the ratio of selected tokens to total tokens, then apply fine_ratio
-                 selected_tokens = sum(self.get_token_length(code_chunks[d['index']]) for d in selected_functions_data)
-                 effective_coarse_rate = selected_tokens / total_tokens if total_tokens > 0 else 1.0
-                 # Use the user-provided fine_ratio, or fall back to rate/coarse target estimate
-                 fine_target_rate = current_fine_ratio
-                 logger.debug(f"Using fine_ratio={fine_target_rate} for fine-grained target calculation.")
-                 target_total_lines = int(total_lines_selected * fine_target_rate)
-
-            else: # Calculate target based on fine_ratio/rate directly applied to selected lines
-                 target_total_lines = int(total_lines_selected * current_fine_ratio)
-                 logger.debug(f"Using current_fine_ratio={current_fine_ratio} for fine-grained target calculation.")
-
-            logger.debug(f"Total lines in selected functions: {total_lines_selected}")
-            logger.debug(f"Target total lines after fine-grained compression: {target_total_lines}")
+            selected_tokens = sum(data["token_count"] for data in selected_functions_data)
+            budget_total = total_lines_selected if fine_budget_mode == "line" else selected_tokens
+            target_total = int(budget_total * current_fine_ratio)
+            logger.debug(
+                f"Fine-grained budget mode={fine_budget_mode}; "
+                f"total allocation weight={budget_total}; target={target_total}"
+            )
 
             # 3. Separate small and large functions
-            small_functions = []
-            large_functions = []
-            lines_in_small_functions = 0
-            lines_in_large_functions = 0
-
-            for data in selected_functions_data:
-                if data["line_count"] < min_lines_for_fine_grained:
-                    small_functions.append(data)
-                    lines_in_small_functions += data["line_count"]
-                else:
-                    large_functions.append(data)
-                    lines_in_large_functions += data["line_count"]
-
-            logger.debug(f"Found {len(small_functions)} small functions (< {min_lines_for_fine_grained} lines) with {lines_in_small_functions} total lines (will be kept).")
-            logger.debug(f"Found {len(large_functions)} large functions (>= {min_lines_for_fine_grained} lines) with {lines_in_large_functions} total lines.")
-
-            # 4. Calculate target lines for large functions
-            target_lines_for_large = max(0, target_total_lines - lines_in_small_functions)
-            logger.debug(f"Target lines to keep from large functions: {target_lines_for_large}")
-
-            # 5. Allocate rates for large functions
-            function_fine_ratios = {} # Map: index -> individual_fine_ratio
-
-            if not large_functions or lines_in_large_functions == 0:
-                 logger.debug("No large functions to compress further or zero lines in large functions.")
-                 global_rate_for_large = 1.0 if lines_in_large_functions > 0 else 0.0 # Should be 0 if lines_in_large_functions is 0
-            elif target_lines_for_large <= 0:
-                 logger.debug("Target lines for large functions is <= 0. Setting rates to 0.")
-                 global_rate_for_large = 0.0
-            elif target_lines_for_large >= lines_in_large_functions:
-                 logger.debug("Target lines for large functions >= total lines. Setting rates to 1.0.")
-                 global_rate_for_large = 1.0
-            else:
-                global_rate_for_large = target_lines_for_large / lines_in_large_functions
-                logger.debug(f"Global target rate for large functions: {global_rate_for_large:.4f}")
-
-                # Normalize scores for weighting (MinMax scaling)
-                scores = [d["score"] for d in large_functions]
-                valid_scores = [s for s in scores if not math.isinf(s) and not math.isnan(s)]
-
-                if not valid_scores or max(valid_scores) == min(valid_scores):
-                    logger.debug("Scores are uniform or invalid, using global rate for all large functions.")
-                    for data in large_functions:
-                        function_fine_ratios[data["index"]] = global_rate_for_large
-                else:
-                    min_score = min(valid_scores)
-                    max_score = max(valid_scores)
-                    normalized_scores = [(s - min_score) / (max_score - min_score) if not math.isinf(s) and not math.isnan(s) else 0.0 for s in scores] # Normalize to [0, 1], default 0 for invalid
-
-                    # Calculate initial biased rates
-                    initial_rates = []
-                    for norm_score in normalized_scores:
-                        # Bias rate: higher score -> higher rate (closer to 1)
-                        # Beta controls sensitivity. beta=0 -> uniform rate. beta=1 -> max sensitivity.
-                        biased_rate = global_rate_for_large * (1 + importance_beta * (norm_score - 0.5) * 2) # Scale norm_score diff to [-beta, beta]
-                        clamped_rate = max(0.0, min(1.0, biased_rate)) # Clamp to [0, 1]
-                        initial_rates.append(clamped_rate)
-
-                    # Calculate actual lines kept with initial rates
-                    actual_lines_kept = sum(initial_rates[i] * large_functions[i]["line_count"] for i in range(len(large_functions)))
-                    logger.debug(f"Initial biased rates calculated. Estimated lines kept: {actual_lines_kept:.1f}")
-
-                    # Adjust rates proportionally to meet target
-                    if actual_lines_kept > 0 and abs(actual_lines_kept - target_lines_for_large) > 1: # Adjust if difference is significant
-                        adjustment_factor = target_lines_for_large / actual_lines_kept
-                        logger.debug(f"Adjusting rates by factor: {adjustment_factor:.4f}")
-                        final_rates = [max(0.0, min(1.0, r * adjustment_factor)) for r in initial_rates] # Adjust and clamp again
-                    else:
-                        logger.debug("Initial rates are close enough or actual_lines_kept is 0, no adjustment needed.")
-                        final_rates = initial_rates
-
-                    for i, data in enumerate(large_functions):
-                        function_fine_ratios[data["index"]] = final_rates[i]
-
-            # Set rate 1.0 for small functions
-            for data in small_functions:
-                function_fine_ratios[data["index"]] = 1.0
+            function_fine_ratios, allocation_info = allocate_fine_grained_ratios(
+                selected_functions_data,
+                current_fine_ratio,
+                min_lines_for_fine_grained,
+                importance_beta,
+                fine_budget_mode,
+            )
+            logger.debug(f"Fine-grained allocation: {allocation_info}")
 
             # --- End Dynamic Allocation ---
 
@@ -1394,6 +1327,8 @@ class LongCodeZip:
                 "demonstrations_sort": demonstrations_sort,
                 "compressed_chunks": fine_compressed_chunks,
                 "fine_grained_method_used": fine_grained_importance_method,
+                "fine_budget_mode": fine_budget_mode,
+                "fine_budget_allocations": allocation_info,
             }
     
     def split_code_by_functions(self, code: str, language: str = "python", custom_separator: str = "# --CHUNK_SEPARATOR-- #") -> List[str]:

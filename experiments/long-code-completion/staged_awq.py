@@ -43,6 +43,7 @@ def setup(outdir, samples_path, args):
     samples = [json.loads(line) for line in samples_bytes.decode("utf-8").splitlines() if line.strip()]
     config = {"samples_sha256": hashlib.sha256(samples_bytes).hexdigest(), "model": MODEL,
               "target_tokens": args.target_tokens, "fine_ratio": args.fine_ratio,
+              "fine_budget_mode": args.fine_budget_mode,
               "importance_beta": 0.0, "max_model_len": args.max_model_len,
               "gpu_memory_utilization": args.gpu_memory_utilization,
               "cpu_offload_gb": args.cpu_offload_gb}
@@ -50,6 +51,7 @@ def setup(outdir, samples_path, args):
     if manifest.exists():
         existing = read_json(manifest)
         existing.setdefault("cpu_offload_gb", 0)
+        existing.setdefault("fine_budget_mode", "line")
         if existing != config:
             raise ValueError("Existing manifest differs from samples or settings; choose a new output directory")
     else:
@@ -151,7 +153,8 @@ def stage_fine(outdir, samples, args):
         print(f"fine {idx}: scoring blocks and generating", flush=True)
         result = engine.compress_code_file(code=background, query=current, instruction=INSTRUCTION,
             rate=coarse["rate"], language="python", rank_only=False,
-            fine_ratio=args.fine_ratio, importance_beta=0.0)
+            fine_ratio=args.fine_ratio, importance_beta=0.0,
+            fine_budget_mode=args.fine_budget_mode)
         compressed_code = result["compressed_code"]
         after = len(engine.tokenizer.encode(compressed_code))
         prompt = (compressed_code + "\n\n" + current).strip()
@@ -163,6 +166,8 @@ def stage_fine(outdir, samples, args):
             "original_background_tokens": coarse["original_background_tokens"],
             "compressed_background_tokens": after, "prompt_tokens": prompt_tokens,
             "compression_factor": coarse["original_background_tokens"] / after,
+            "fine_budget_mode": args.fine_budget_mode,
+            "fine_budget_allocations": result.get("fine_budget_allocations", {}),
             "prompt": prompt, "output": output, "es": compute_ES(sample["gt"], output),
             "em": compute_EM(sample["gt"], output), "seconds": time.monotonic() - start})
         print(f"fine {idx}: done", flush=True)
@@ -182,6 +187,7 @@ if __name__ == "__main__":
     p.add_argument("--outdir", type=Path, default=ROOT / "experiments/long-code-completion/results/awq-staged")
     p.add_argument("--target-tokens", type=int, default=2048)
     p.add_argument("--fine-ratio", type=float, default=0.5)
+    p.add_argument("--fine-budget-mode", choices=["line", "token"], default="line")
     p.add_argument("--max-model-len", type=int, default=8192)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.78)
     p.add_argument("--cpu-offload-gb", type=float, default=0)
