@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-session_name="lcz-staged"
+session_name="${LCZ_STAGED_SESSION:-lcz-staged}"
 if tmux has-session -t "=$session_name" 2>/dev/null; then
     echo "Session $session_name already exists. Open it with: tmux attach -t $session_name"
     exit 1

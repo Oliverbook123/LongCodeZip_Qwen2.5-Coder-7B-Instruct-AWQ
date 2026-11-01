@@ -149,10 +149,25 @@ class EntropyChunking:
             'mad': threshold_mad
         }
 
-    def find_ppl_spikes_adaptive(self, values: List[float], method: str = 'std', k: float = 0.2) -> tuple:
-        """Find PPL spikes using adaptive threshold based on statistical method"""
-        thresholds = self.calculate_adaptive_thresholds(values, k)
-        threshold = thresholds[method]
+    def find_ppl_spikes_adaptive(
+        self,
+        values: List[float],
+        method: str = 'std',
+        k: float = 0.2,
+        chunking_mode: str = "source",
+    ) -> tuple:
+        """Find PPL spikes using the source or paper threshold rule."""
+        if chunking_mode not in {"source", "paper"}:
+            raise ValueError(f"Unsupported chunking_mode: {chunking_mode}")
+        if chunking_mode == "paper":
+            valid_ppls = [
+                p for p in values
+                if not math.isinf(p) and not math.isnan(p)
+            ]
+            threshold = k * float(np.std(valid_ppls)) if valid_ppls else 0.5
+        else:
+            thresholds = self.calculate_adaptive_thresholds(values, k)
+            threshold = thresholds[method]
         
         spike_indices = []
         
@@ -173,21 +188,43 @@ class EntropyChunking:
             left_diff = current - left
             right_diff = current - right
             
-            # Condition: Current PPL is higher than both neighbors with adaptive threshold
             if (left_diff >= threshold or right_diff >= threshold) and (left_diff >= 0 and right_diff >= 0):
                 spike_indices.append(i)
         
         return spike_indices, threshold
 
-    def chunk_text_adaptive(self, text: str, method: str = 'std', k: float = 0.2) -> tuple:
-        """Perform PPL-based text chunking using adaptive spike detection"""
+    def chunk_text_adaptive(
+        self,
+        text: str,
+        method: str = 'std',
+        k: float = 0.2,
+        chunking_mode: str = "source",
+    ) -> tuple:
+        """Perform PPL-based text chunking using source or paper boundaries."""
         sentences = self.split_into_sentences(text)
         ppls = self.calculate_sentence_ppl(sentences)
-        spike_indices, threshold = self.find_ppl_spikes_adaptive(ppls, method, k)
-        
+        return self.chunk_from_ppls(sentences, ppls, method, k, chunking_mode)
+
+    def chunk_from_ppls(
+        self,
+        sentences: List[str],
+        ppls: List[float],
+        method: str = 'std',
+        k: float = 0.2,
+        chunking_mode: str = "source",
+    ) -> tuple:
+        """Apply a boundary rule to existing per-line scores without a model."""
+        if len(sentences) != len(ppls):
+            raise ValueError("Sentence and perplexity counts differ")
+        spike_indices, threshold = self.find_ppl_spikes_adaptive(
+            ppls, method, k, chunking_mode
+        )
+
         chunks = []
-        # Split at spike points (after the spike line)
-        split_points = [0] + [idx + 1 for idx in spike_indices] + [len(sentences)]
+        split_offset = 0 if chunking_mode == "paper" else 1
+        split_points = [0] + [
+            idx + split_offset for idx in spike_indices
+        ] + [len(sentences)]
         
         for i in range(len(split_points) - 1):
             start = split_points[i]
@@ -618,6 +655,7 @@ class LongCodeZip:
         use_knapsack: bool = True,
         repeat_instruction_at_end: bool = True,
         fine_budget_mode: str = "line",
+        chunking_mode: str = "source",
     ):
         """
         Compress a code file by first splitting it into function-based chunks and then compressing.
@@ -640,6 +678,7 @@ class LongCodeZip:
             use_knapsack: Whether to use knapsack algorithm for block selection (True) or greedy line-by-line approach (False).
             repeat_instruction_at_end: Whether to repeat instruction at the end of the prompt
             fine_budget_mode: Fine-grained budget allocation mode ("line" or "token")
+            chunking_mode: Entropy boundary rule ("source" or "paper")
             
         Returns:
             Compressed code and statistics with the following structure:
@@ -659,6 +698,8 @@ class LongCodeZip:
             }
         """
         logger.debug(f"Starting code file compression with rate={rate}, target_token={target_token}, language={language}")
+        if chunking_mode not in {"source", "paper"}:
+            raise ValueError(f"Unsupported chunking_mode: {chunking_mode}")
         start_time = time.time()
         
         # Split code into function-based chunks
@@ -875,7 +916,7 @@ class LongCodeZip:
 
                     # Use Entropy chunking for fine-grained compression instead of simple line splitting
                     chunks, sentences, ppls, spike_indices = self.entropy_chunking.chunk_text_adaptive(
-                        code_chunks[i], method='std', k=0.2
+                        code_chunks[i], method='std', k=0.2, chunking_mode=chunking_mode
                     )
                     # Use chunks as lines, but preserve all chunks including empty ones to maintain formatting
                     chunk_lines = chunks  # Keep all chunks to preserve \n\n and formatting
@@ -1328,6 +1369,7 @@ class LongCodeZip:
                 "compressed_chunks": fine_compressed_chunks,
                 "fine_grained_method_used": fine_grained_importance_method,
                 "fine_budget_mode": fine_budget_mode,
+                "chunking_mode": chunking_mode,
                 "fine_budget_allocations": allocation_info,
             }
     
