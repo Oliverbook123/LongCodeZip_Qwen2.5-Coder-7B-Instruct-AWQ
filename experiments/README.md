@@ -140,3 +140,78 @@ CPU-only regression checks, from the repository root:
 ```bash
 ~/miniconda3/envs/py39/bin/python -m unittest discover -s tests -p 'test_*chunking*.py' -v
 ```
+
+#### Block AMI normalization comparison (experiment 4)
+
+Experiment 4 fixes source chunking, token-weighted function budgets, preserved
+blocks, and the historical solver thresholds. It compares `--block-value-mode raw`
+(the backward-compatible default) with `--block-value-mode minmax`. All model
+commands use `py39`; no additional dependencies are required.
+
+The normalization policy is explicit: within each function, all finite scores
+for nonempty blocks participate in min/max statistics, including preserved
+blocks. Constant or absent finite scores map to zero. Invalid scores retain the
+historical zero-value treatment and do not determine the extrema. These are
+experiment conventions, recorded in the per-function `normalization` metadata.
+The current small-function rule and DP/greedy switch are retained. Consequently,
+degenerate zero-valued instances may behave differently under the two solvers;
+the report counts these cases and records the actual solver for each function.
+
+The runner imports the completed `exp3-source-offload4` baseline's coarse and
+entropy inputs. The `ami` stage scores active blocks once, without performing
+knapsack selection or completion. Both final arms read the same raw AMI cache.
+The old baseline's completion outputs are not substituted for the new raw arm.
+
+From `experiments/long-code-completion`, prepare and validate inputs on CPU:
+
+```bash
+bash run_ami_comparison.sh --prepare-only
+```
+
+Then start a five-sample pilot in tmux, with live output and a persistent log:
+
+```bash
+bash start_ami_comparison.sh --pilot 5
+tmux attach -t lcz-exp4
+```
+
+After reviewing the pilot, run `bash start_ami_comparison.sh` to continue all
+500 samples. The pilot writes per-sample outputs but no full-run summary. Its
+existing scores and outputs are validated and reused when the cache grows;
+completed stages skip model initialization. `LCZ_AMI_SESSION` overrides the
+tmux session name. A live session must finish before starting another run.
+
+Outputs under `results/`:
+
+| Directory/file | Contents |
+| --- | --- |
+| `exp4-shared-offload4/coarse` and `entropy` | Fixed function choices and blocks |
+| `exp4-shared-offload4/ami` | Raw per-block scores, token weights, target budgets, preservation sets, scoring time, and input fingerprints |
+| `exp4-raw-offload4/results` | Raw-value selections and completions |
+| `exp4-minmax-offload4/results` | Min-Max-value selections and completions |
+| Each arm's `summary.json` | Full-run ES, EM and both compression-factor summaries |
+| `exp4-comparison.csv` | Validated paired metrics, changed selections, degenerate cases and solver counts |
+| `exp4-run.log` | Live run log, also visible in tmux |
+
+Each scored function records `raw_ami`, `block_values`, `block_weights`,
+`target_tokens`, `preserved_blocks`, `selected_blocks`, normalization metadata,
+solver choice, and selection time. Functions skipped by the historical rule
+retain all blocks and use `raw_ami: null` rather than fabricated scores.
+Each result binds the exact AMI checkpoint hash and the value mode. Query,
+block, budget, and cache mismatches fail before generation. Shared scoring cost
+is reported once; cache-read timing in each arm is distinct from model scoring.
+The compression time in an arm includes cache access, normalization, selection,
+and assembly, while completion generation is timed separately. Allocated
+budgets and actual token counts are both reported.
+
+Use `LCZ_AMI_BASE_DIR`, `LCZ_AMI_SAMPLES`, `LCZ_AMI_SOURCE_DIR`,
+`LCZ_AMI_SHARED_DIR`, `LCZ_AMI_RAW_DIR`, and `LCZ_AMI_MINMAX_DIR` to override
+paths. The source manifest must match the supplied samples and settings.
+Legacy scripts default a missing `block_value_mode` to `raw`; experiment 1–3
+manifests and checkpoints continue to use their prior modes and fingerprints.
+
+Run the chunking and AMI CPU regression checks from the repository root:
+
+```bash
+~/miniconda3/envs/py39/bin/python -m unittest discover -s tests -p 'test_*.py' -v
+```

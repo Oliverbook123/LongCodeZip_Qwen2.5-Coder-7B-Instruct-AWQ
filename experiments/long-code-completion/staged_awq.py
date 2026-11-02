@@ -58,12 +58,19 @@ def normalized_config(config):
     config.setdefault("cpu_offload_gb", 0)
     config.setdefault("fine_budget_mode", "line")
     config.setdefault("chunking_mode", "source")
+    config.setdefault("block_value_mode", "raw")
     return config
 
 
 def common_config(config):
     return {key: value for key, value in normalized_config(config).items()
             if key not in {"chunking_mode", "shared_reference"}}
+
+
+def shared_input_config(config):
+    # Normalization and the AMI cache location do not affect coarse/entropy inputs.
+    return {key: value for key, value in common_config(config).items()
+            if key not in {"block_value_mode", "ami_cache"}}
 
 
 def checkpoint_paths(directory, stage, samples):
@@ -120,6 +127,7 @@ def validate_result(sample, coarse, entropy, row, config, allow_legacy=False):
             row["gt"] != sample["gt"] or
             row.get("chunking_mode", "source") != config["chunking_mode"] or
             row.get("fine_budget_mode", "line") != config["fine_budget_mode"] or
+            row.get("block_value_mode", "raw") != config.get("block_value_mode", "raw") or
             row["original_background_tokens"] != coarse["original_background_tokens"]):
         raise ValueError(f"Result settings differ for sample {sample_id(sample)}")
     for key, expected in (("coarse_sha256", coarse_fingerprint(coarse)),
@@ -177,6 +185,7 @@ def setup(outdir, samples_path, args):
               "target_tokens": args.target_tokens, "fine_ratio": args.fine_ratio,
               "fine_budget_mode": args.fine_budget_mode,
               "chunking_mode": args.chunking_mode,
+              "block_value_mode": getattr(args, "block_value_mode", "raw"),
               "importance_beta": 0.0, "max_model_len": args.max_model_len,
               "gpu_memory_utilization": args.gpu_memory_utilization,
               "cpu_offload_gb": args.cpu_offload_gb}
@@ -186,7 +195,7 @@ def setup(outdir, samples_path, args):
         if reference == outdir.resolve():
             raise ValueError("Output directory must differ from the shared reference")
         reference_config = normalized_config(read_json(reference / "manifest.json"))
-        if reference_config["chunking_mode"] != "source" or common_config(reference_config) != common_config(config):
+        if reference_config["chunking_mode"] != "source" or shared_input_config(reference_config) != shared_input_config(config):
             raise ValueError("Shared source reference differs from samples or settings")
         hashes = {}
         for stage in ("coarse", "entropy", "results"):
@@ -195,6 +204,19 @@ def setup(outdir, samples_path, args):
                                          for idx, path in paths.items()})
         config["shared_reference"] = {"directory": str(reference), "checkpoint_sha256": hashes,
                                       "manifest_sha256": hashlib.sha256((reference / "manifest.json").read_bytes()).hexdigest()}
+    ami_cache = getattr(args, "ami_cache", None)
+    if ami_cache is not None:
+        ami_cache = ami_cache.resolve()
+        cache_config = normalized_config(read_json(ami_cache / "manifest.json"))
+        if (shared_input_config(cache_config) != shared_input_config(config) or
+                cache_config["chunking_mode"] != config["chunking_mode"] or
+                cache_config["block_value_mode"] != "raw" or "ami_cache" in cache_config):
+            raise ValueError("AMI cache experiment settings differ")
+        paths = {path.stem: path for path in (ami_cache / "ami").glob("*.json")}
+        if set(paths) - {sample_id(sample) for sample in samples}:
+            raise ValueError("AMI cache contains unexpected sample IDs")
+        config["ami_cache"] = {"directory": str(ami_cache),
+                               "manifest_sha256": hashlib.sha256((ami_cache / "manifest.json").read_bytes()).hexdigest()}
     manifest = outdir / "manifest.json"
     if manifest.exists():
         existing = normalized_config(read_json(manifest))
@@ -429,20 +451,96 @@ class CachedEntropy:
         return row["chunks"], row["sentences"], row["ppls"], row["spike_indices"]
 
 
+def working_samples(samples, args):
+    limit = getattr(args, "max_samples", None)
+    return samples if limit is None else samples[:limit]
+
+
+def load_ami(outdir, sample, coarse, entropy, args):
+    from ami_cache import validate_checkpoint
+    row = read_json(outdir / "ami" / (sample_id(sample) + ".json"))
+    reference = read_json(args.reuse_from / "results" / (sample_id(sample) + ".json"))
+    validate_checkpoint(row, sample, entropy, reference["fine_budget_allocations"],
+                        coarse_fingerprint(coarse), entropy_fingerprint(entropy))
+    return row
+
+
+def stage_ami(outdir, samples, args):
+    """Calculate raw block scores once; selection/generation happens in fine."""
+    if args.reuse_from is None or getattr(args, "ami_cache", None) is not None or getattr(args, "block_value_mode", "raw") != "raw":
+        raise ValueError("ami requires --reuse-from, raw mode, and no --ami-cache")
+    pending = []
+    for sample in working_samples(samples, args):
+        idx = sample_id(sample)
+        coarse = read_json(outdir / "coarse" / (idx + ".json"))
+        entropy = read_json(outdir / "entropy" / (idx + ".json"))
+        validate_entropy(sample, coarse, entropy, args.chunking_mode)
+        validate_shared_inputs(sample, coarse, entropy, args.reuse_from)
+        if (outdir / "ami" / (idx + ".json")).exists():
+            load_ami(outdir, sample, coarse, entropy, args)
+        else:
+            pending.append(sample)
+    if not pending:
+        print("Requested AMI checkpoints validated; no model loaded", flush=True)
+        return
+    from demo_awq import VllmCompressor
+    from ami_cache import digest, query_digest, validate_checkpoint
+    engine = VllmCompressor(MODEL, args.max_model_len, args.gpu_memory_utilization,
+                            load_entropy=False, cpu_offload_gb=args.cpu_offload_gb)
+    for sample in pending:
+        idx = sample_id(sample)
+        coarse = read_json(outdir / "coarse" / (idx + ".json"))
+        entropy = read_json(outdir / "entropy" / (idx + ".json"))
+        engine.entropy_chunking = CachedEntropy(entropy["functions"], args.chunking_mode)
+        selected, ranking = coarse["selected_functions"], coarse["demonstrations_sort"]
+        engine.control_context_budget = lambda contexts, **kw: ([contexts[i] for i in selected], selected, [0.0] * len(selected), ranking)
+        start = time.monotonic()
+        print(f"ami {idx}: scoring blocks", flush=True)
+        result = engine.compress_code_file(
+            code=sample["background_context"].replace("<|endoftext|>", ""),
+            query=sample["current_function_context"], instruction=INSTRUCTION,
+            rate=coarse["rate"], language="python", fine_ratio=args.fine_ratio,
+            importance_beta=0.0, fine_budget_mode=args.fine_budget_mode,
+            chunking_mode=args.chunking_mode, block_value_mode="raw", score_only=True)
+        functions = {str(i): {**value,
+            "function_sha256": entropy["functions"][str(i)]["text_sha256"],
+            "blocks_sha256": digest(entropy["functions"][str(i)]["chunks"])}
+            for i, value in result["function_compressions"].items()}
+        reference = read_json(args.reuse_from / "results" / (idx + ".json"))
+        row = {"schema_version": 1, "source_index": sample["source_index"], "functions": functions,
+               "query_sha256": query_digest(sample["current_function_context"]), "method": "conditional_ppl",
+               "coarse_sha256": coarse_fingerprint(coarse), "entropy_sha256": entropy_fingerprint(entropy),
+               "fine_budget_allocations": {str(i): value for i, value in result["fine_budget_allocations"].items()},
+               "seconds": time.monotonic() - start}
+        validate_checkpoint(row, sample, entropy, reference["fine_budget_allocations"],
+                            coarse_fingerprint(coarse), entropy_fingerprint(entropy))
+        atomic_json(outdir / "ami" / (idx + ".json"), row)
+        print(f"ami {idx}: done", flush=True)
+
+
 def stage_fine(outdir, samples, args):
     config = normalized_config(read_json(outdir / "manifest.json"))
+    requested = working_samples(samples, args)
+    ami_cache = getattr(args, "ami_cache", None)
+    if ami_cache is not None and args.reuse_from is None:
+        raise ValueError("--ami-cache requires --reuse-from")
     pending = []
-    for sample in samples:
+    for sample in requested:
         idx = sample_id(sample)
         coarse = read_json(outdir / "coarse" / (idx + ".json"))
         entropy = read_json(outdir / "entropy" / (idx + ".json"))
         validate_entropy(sample, coarse, entropy, args.chunking_mode)
         if args.reuse_from is not None:
             validate_shared_inputs(sample, coarse, entropy, args.reuse_from)
+        if ami_cache is not None:
+            cache = load_ami(ami_cache, sample, coarse, entropy, args)
         path = outdir / "results" / (idx + ".json")
         if path.exists():
             row = read_json(path)
             validate_result(sample, coarse, entropy, row, config)
+            if ami_cache is not None:
+                from ami_cache import validate_result as validate_ami_result
+                validate_ami_result(row, cache, entropy, config["block_value_mode"])
             if args.reuse_from is not None:
                 reference_row = read_json(args.reuse_from / "results" / (idx + ".json"))
                 if row["fine_budget_allocations"] != reference_row["fine_budget_allocations"]:
@@ -450,6 +548,9 @@ def stage_fine(outdir, samples, args):
         else:
             pending.append(sample)
     if not pending:
+        if len(requested) != len(samples):
+            print(f"Pilot results validated: {len(requested)}/{len(samples)}; no final summary or model loaded", flush=True)
+            return
         rows = [read_json(outdir / "results" / (sample_id(s) + ".json")) for s in samples]
         atomic_json(outdir / "summary.json", summarize_rows(rows))
         print("All fine checkpoints validated; no model loaded", flush=True)
@@ -465,6 +566,10 @@ def stage_fine(outdir, samples, args):
         coarse = read_json(outdir / "coarse" / (idx + ".json"))
         entropy = read_json(outdir / "entropy" / (idx + ".json"))
         engine.entropy_chunking = CachedEntropy(entropy["functions"], args.chunking_mode)
+        if ami_cache is not None:
+            from ami_cache import CachedBlockScorer, digest
+            cache = load_ami(ami_cache, sample, coarse, entropy, args)
+            engine.score_blocks = CachedBlockScorer(cache).score_blocks
         selected = coarse["selected_functions"]
         ranking = coarse["demonstrations_sort"]
         engine.control_context_budget = lambda contexts, **kw: ([contexts[i] for i in selected], selected, [0.0] * len(selected), ranking)
@@ -475,12 +580,19 @@ def stage_fine(outdir, samples, args):
         result = engine.compress_code_file(code=background, query=current, instruction=INSTRUCTION,
             rate=coarse["rate"], language="python", rank_only=False,
             fine_ratio=args.fine_ratio, importance_beta=0.0,
-            fine_budget_mode=args.fine_budget_mode, chunking_mode=args.chunking_mode)
+            fine_budget_mode=args.fine_budget_mode, chunking_mode=args.chunking_mode,
+            block_value_mode=getattr(args, "block_value_mode", "raw"))
         allocations = {str(i): value for i, value in result.get("fine_budget_allocations", {}).items()}
         if args.reuse_from is not None:
             reference_row = read_json(args.reuse_from / "results" / (idx + ".json"))
             if allocations != reference_row["fine_budget_allocations"]:
                 raise ValueError(f"Paired function budgets differ for sample {idx}")
+        if ami_cache is not None:
+            from ami_cache import validate_result as validate_ami_result
+            validate_ami_result({"ami_sha256": digest(cache),
+                                 "block_value_mode": getattr(args, "block_value_mode", "raw"),
+                                 "function_compressions": result["function_compressions"]},
+                                cache, entropy, config["block_value_mode"])
         compressed_code = result["compressed_code"]
         after = len(engine.tokenizer.encode(compressed_code))
         prompt = (compressed_code + "\n\n" + current).strip()
@@ -496,6 +608,7 @@ def stage_fine(outdir, samples, args):
             "compression_factor": coarse["original_background_tokens"] / after,
             "fine_budget_mode": args.fine_budget_mode,
             "chunking_mode": args.chunking_mode,
+            "block_value_mode": getattr(args, "block_value_mode", "raw"),
             "fine_budget_allocations": allocations,
             "function_compressions": result.get("function_compressions", {}),
             "coarse_sha256": coarse_fingerprint(coarse), "entropy_sha256": entropy_fingerprint(entropy),
@@ -503,9 +616,20 @@ def stage_fine(outdir, samples, args):
             "generation_seconds": time.monotonic() - generation_start,
             "prompt": prompt, "output": output, "es": compute_ES(sample["gt"], output),
             "em": compute_EM(sample["gt"], output), "seconds": time.monotonic() - start}
+        if ami_cache is not None:
+            row["ami_sha256"] = digest(cache)
+            row["scoring_source"] = "shared_ami_cache"
+            row["scoring_cache_read_seconds"] = sum(f["scoring_seconds"] for f in result["function_compressions"].values())
+            row["shared_scoring_seconds"] = sum(f["scoring_seconds"] for f in cache["functions"].values())
+            row["selection_seconds"] = sum(f["selection_seconds"] for f in result["function_compressions"].values())
+            from ami_cache import validate_result as validate_ami_result
+            validate_ami_result(row, cache, entropy, config["block_value_mode"])
         validate_result(sample, coarse, entropy, row, config)
         atomic_json(path, row)
         print(f"fine {idx}: done", flush=True)
+    if len(requested) != len(samples):
+        print(f"Pilot complete: {len(requested)}/{len(samples)}; full-run summary deferred", flush=True)
+        return
     rows = [read_json(outdir / "results" / (sample_id(s) + ".json")) for s in samples]
     summary = summarize_rows(rows)
     atomic_json(outdir / "summary.json", summary)
@@ -514,13 +638,16 @@ def stage_fine(outdir, samples, args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("stage", choices=["prepare", "migrate", "coarse", "entropy", "fine"])
+    p.add_argument("stage", choices=["prepare", "migrate", "coarse", "entropy", "ami", "fine"])
     p.add_argument("--samples", type=Path, default=ROOT / "experiments/long-code-completion/results/awq-pilot/samples.jsonl")
     p.add_argument("--outdir", type=Path, default=ROOT / "experiments/long-code-completion/results/awq-staged")
     p.add_argument("--target-tokens", type=int, default=2048)
     p.add_argument("--fine-ratio", type=float, default=0.5)
     p.add_argument("--fine-budget-mode", choices=["line", "token"], default="line")
     p.add_argument("--chunking-mode", choices=["source", "paper"], default="source")
+    p.add_argument("--block-value-mode", choices=["raw", "minmax"], default="raw")
+    p.add_argument("--ami-cache", type=Path, help="Shared raw AMI checkpoint directory")
+    p.add_argument("--max-samples", type=int, help="Process the first N samples for a resumable pilot")
     p.add_argument("--reuse-from", type=Path,
                    help="Completed source experiment supplying shared coarse decisions and per-line PPL")
     p.add_argument("--migrate-from", type=Path,
@@ -529,6 +656,10 @@ if __name__ == "__main__":
     p.add_argument("--gpu-memory-utilization", type=float, default=0.78)
     p.add_argument("--cpu-offload-gb", type=float, default=0)
     args = p.parse_args()
+    if args.max_samples is not None and (args.max_samples <= 0 or args.stage not in {"ami", "fine"}):
+        p.error("--max-samples must be positive and is only valid for ami or fine")
+    if args.ami_cache is not None and (args.reuse_from is None or args.stage not in {"prepare", "fine"}):
+        p.error("--ami-cache requires --reuse-from and the prepare or fine stage")
     if args.stage == "prepare" and args.reuse_from is None:
         p.error("prepare requires --reuse-from")
     if (args.stage == "migrate") != (args.migrate_from is not None):
@@ -549,5 +680,7 @@ if __name__ == "__main__":
         stage_coarse(args.outdir, samples, args)
     elif args.stage == "entropy":
         stage_entropy(args.outdir, samples, args)
+    elif args.stage == "ami":
+        stage_ami(args.outdir, samples, args)
     else:
         stage_fine(args.outdir, samples, args)

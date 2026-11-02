@@ -12,6 +12,7 @@ import bisect
 import json
 from loguru import logger
 from .budget import allocate_fine_grained_ratios
+from .ami import block_values
 import sys
 # set the level to info only, no need to show the debug messages
 logger.remove()
@@ -656,6 +657,8 @@ class LongCodeZip:
         repeat_instruction_at_end: bool = True,
         fine_budget_mode: str = "line",
         chunking_mode: str = "source",
+        block_value_mode: str = "raw",
+        score_only: bool = False,
     ):
         """
         Compress a code file by first splitting it into function-based chunks and then compressing.
@@ -679,6 +682,8 @@ class LongCodeZip:
             repeat_instruction_at_end: Whether to repeat instruction at the end of the prompt
             fine_budget_mode: Fine-grained budget allocation mode ("line" or "token")
             chunking_mode: Entropy boundary rule ("source" or "paper")
+            block_value_mode: Knapsack values ("raw" or per-function "minmax")
+            score_only: Collect block scores and metadata without selecting blocks
             
         Returns:
             Compressed code and statistics with the following structure:
@@ -700,6 +705,12 @@ class LongCodeZip:
         logger.debug(f"Starting code file compression with rate={rate}, target_token={target_token}, language={language}")
         if chunking_mode not in {"source", "paper"}:
             raise ValueError(f"Unsupported chunking_mode: {chunking_mode}")
+        if block_value_mode not in {"raw", "minmax"}:
+            raise ValueError(f"Unsupported block_value_mode: {block_value_mode}")
+        if block_value_mode != "raw" and not use_knapsack:
+            raise ValueError("minmax block values require use_knapsack=True")
+        if score_only and rank_only:
+            raise ValueError("score_only cannot be combined with rank_only")
         start_time = time.time()
         
         # Split code into function-based chunks
@@ -939,6 +950,13 @@ class LongCodeZip:
                             "compression_ratio": 1.0,
                             "individual_fine_ratio": individual_fine_ratio,
                             "note": note,
+                            "raw_ami": None,
+                            "block_weights": [self.get_token_length(block) for block in chunk_lines],
+                            "preserved_blocks": sorted(self.preserved_blocks(chunk_lines, language)),
+                            "selected_blocks": list(range(len(chunk_lines))),
+                            "target_tokens": int(chunk_tokens * individual_fine_ratio),
+                            "scoring_seconds": 0.0, "selection_seconds": 0.0,
+                            "scoring_skipped": True,
                             "importance_method": None # No line importance calculation needed
                         }
                         continue # Move to next chunk
@@ -954,114 +972,24 @@ class LongCodeZip:
                         original_func_tokens = self.get_token_length(chunk)
                         target_func_tokens = int(original_func_tokens * individual_fine_ratio)
                         
-                        # Calculate importance for each block based on the chosen method
-                        block_importances = []
-                        importance_calculation_start = time.time()
+                        importance_calculation_start = time.monotonic()
+                        block_importances = self.score_blocks(
+                            chunk_lines, query, fine_grained_importance_method, function_index=i)
+                        scoring_seconds = time.monotonic() - importance_calculation_start
 
-                        if fine_grained_importance_method == "conditional_ppl":
-                            # Calculate conditional PPL importance for each block
-                            if not query or not query.strip():
-                                logger.warning(f"Query is empty for func {i}, cannot calculate conditional PPL. Assigning 0 importance.")
-                                block_importances = [0.0] * len(chunk_lines)
-                            else:
-                                query_ppl_result = self.get_ppl(query, granularity="line")
-                                query_ppl_without_context = query_ppl_result["ppl"]
-
-                                if math.isinf(query_ppl_without_context):
-                                    logger.warning(f"Base query PPL is infinite for func {i}. Assigning 0 importance to blocks.")
-                                    block_importances = [0.0] * len(chunk_lines)
-                                else:
-                                    pbar_cond = tqdm(enumerate(chunk_lines), total=len(chunk_lines), desc=f"Func {i} Block CondPPL", leave=False)
-                                    for block_idx, block in pbar_cond:
-                                        if not block.strip():
-                                            block_importances.append(-float('inf'))  # Low score for empty blocks
-                                            continue
-
-                                        conditional_text = block + "\n\n" + query
-                                        prefix_len_text = block + "\n\n"
-                                        prefix_len = self.get_token_length(prefix_len_text, add_special_tokens=True)
-
-                                        cond_ppl_result = self.get_ppl(
-                                            text=conditional_text,
-                                            granularity="line",
-                                            condition_mode="prefix",
-                                            condition_pos_id=prefix_len - 1
-                                        )
-                                        ppl_with_context = cond_ppl_result["ppl"]
-
-                                        if math.isinf(ppl_with_context):
-                                            ppl_change = -float('inf')
-                                        else:
-                                            ppl_change = query_ppl_without_context - ppl_with_context
-
-                                        block_importances.append(ppl_change)
-                                        pbar_cond.set_description(f"Func {i} Block CondPPL (B{block_idx}: {ppl_change:.2f})")
-
-                        elif fine_grained_importance_method == "contrastive_perplexity":
-                            # Calculate contrastive PPL importance for each block
-                            fine_grained_pbar.set_description(f"Fine-Grained ContrastivePPL Func {i}")
-                            
-                            with torch.no_grad():
-                                pbar = tqdm(enumerate(chunk_lines), total=len(chunk_lines), desc="Block Contrastive PPL", leave=False)
-                                for block_idx, block in pbar:
-                                    if not block.strip():
-                                        block_importances.append(-float('inf'))
-                                        continue
-
-                                    # Build context from previous blocks
-                                    prev_context = "\n\n".join(chunk_lines[:block_idx]) if block_idx > 0 else ""
-                                    
-                                    # 1. PPL(Block | prev_blocks)
-                                    regular_ppl_condition = prev_context + "\n\n" if prev_context else None
-                                    regular_ppl = self._calculate_perplexity_for_contrastive(block, condition_text=regular_ppl_condition)
-
-                                    # 2. PPL(Block | query, prev_blocks)
-                                    question_context_parts = [query]
-                                    if prev_context:
-                                        question_context_parts.append(prev_context)
-                                    question_context = "\n\n".join(filter(None, question_context_parts))
-                                    cond_ppl_condition = question_context + "\n\n"
-                                    cond_ppl = self._calculate_perplexity_for_contrastive(block, condition_text=cond_ppl_condition)
-
-                                    # 3. Importance = PPL(Block|prev) - PPL(Block|Q,prev)
-                                    if math.isinf(regular_ppl) or math.isinf(cond_ppl):
-                                        importance = -float('inf')
-                                    else:
-                                        importance = regular_ppl - cond_ppl
-
-                                    block_importances.append(importance)
-                                    pbar.set_description(f"Block {block_idx}: {importance:.2f}")
-                                    if torch.cuda.is_available() and (block_idx + 1) % 50 == 0:
-                                        torch.cuda.empty_cache()
-
-                        else:
-                            raise ValueError(f"Unsupported fine_grained_importance_method: {fine_grained_importance_method}")
-
-                        importance_calculation_end = time.time()
-                        logger.debug(f"  - Block importance calculation took {importance_calculation_end - importance_calculation_start:.2f}s")
-
-                        # Identify preserved blocks (function signature, comments, returns)
-                        preserved_block_indices = set()
+                        preserved_block_indices = self.preserved_blocks(chunk_lines, language)
                         comment_marker = "#" if language.lower() in ["python", "typescript", "rust"] else "//"
-                        
-                        # Find blocks containing function signature
-                        for block_idx, block in enumerate(chunk_lines):
-                            block_lines = block.split('\n')
-                            for line in block_lines:
-                                if line.strip():
-                                    # Check for function/class definitions
-                                    if any(keyword in line for keyword in ['def ', 'class ', 'function ', 'fn ', 'func ']):
-                                        preserved_block_indices.add(block_idx)
-                                        break
-                                    # Check for function-level comments
-                                    if line.strip().startswith(comment_marker):
-                                        preserved_block_indices.add(block_idx)
-                                        break
-                                    # Check for return statements
-                                    if 'return ' in line:
-                                        preserved_block_indices.add(block_idx)
-                                        break
-                                    break  # Only check first non-empty line of each block
+                        if score_only:
+                            function_compressions[i] = {
+                                "raw_ami": block_importances,
+                                "block_weights": [self.get_token_length(block) for block in chunk_lines],
+                                "preserved_blocks": sorted(preserved_block_indices),
+                                "target_tokens": target_func_tokens, "scoring_seconds": scoring_seconds,
+                                "scoring_skipped": False,
+                            }
+                            fine_compressed_chunks.append(chunk)
+                            compressed_tokens += original_func_tokens
+                            continue
 
                         # Choose selection method based on use_knapsack parameter
                         processing_start = time.time()
@@ -1074,7 +1002,8 @@ class LongCodeZip:
                                 block_importances=block_importances,
                                 target_tokens=target_func_tokens,
                                 preserved_block_indices=preserved_block_indices,
-                                language=language
+                                language=language,
+                                block_value_mode=block_value_mode,
                             )
                             
                             # Build compressed chunk from selected blocks
@@ -1268,6 +1197,14 @@ class LongCodeZip:
                             "importance_method": fine_grained_importance_method,
                             "selection_method": "knapsack" if use_knapsack else "greedy_line_by_line"
                         }
+                        function_compressions[i].update({
+                            "raw_ami": block_importances, "target_tokens": target_func_tokens,
+                            "scoring_seconds": scoring_seconds, "scoring_skipped": False,
+                            "selection_seconds": selection_info["selection_seconds"] if use_knapsack else processing_end - processing_start,
+                        })
+                        if use_knapsack:
+                            function_compressions[i].update({key: selection_info[key] for key in
+                                ("block_values", "block_weights", "normalization", "solver")})
                         logger.debug(f"  - Compressed func {i}: {original_func_tokens} -> {compressed_chunk_tokens} tokens (Ratio: {actual_compression_ratio:.3f})")
                     else:
                          # This case should now be handled by the check at the beginning of the loop
@@ -1370,6 +1307,8 @@ class LongCodeZip:
                 "fine_grained_method_used": fine_grained_importance_method,
                 "fine_budget_mode": fine_budget_mode,
                 "chunking_mode": chunking_mode,
+                "block_value_mode": block_value_mode,
+                "score_only": score_only,
                 "fine_budget_allocations": allocation_info,
             }
     
@@ -1578,13 +1517,125 @@ class LongCodeZip:
         logger.debug(f"Finished calculating contrastive PPL for {len(line_scores)} lines.")
         return line_scores, scored_indices
 
+    def score_blocks(self, blocks, query, method="conditional_ppl", function_index=None):
+        """Calculate raw block AMI; function_index identifies cached function scores."""
+        chunk_lines = blocks
+        block_importances = []
+        if method == "conditional_ppl":
+            # Calculate conditional PPL importance for each block
+            if not query or not query.strip():
+                logger.warning("Query is empty; assigning zero block importance.")
+                block_importances = [0.0] * len(chunk_lines)
+            else:
+                query_ppl_result = self.get_ppl(query, granularity="line")
+                query_ppl_without_context = query_ppl_result["ppl"]
+
+                if math.isinf(query_ppl_without_context):
+                    logger.warning("Base query PPL is infinite; assigning zero block importance.")
+                    block_importances = [0.0] * len(chunk_lines)
+                else:
+                    pbar_cond = tqdm(enumerate(chunk_lines), total=len(chunk_lines), desc=f"Func {function_index} Block CondPPL", leave=False)
+                    for block_idx, block in pbar_cond:
+                        if not block.strip():
+                            block_importances.append(-float('inf'))  # Low score for empty blocks
+                            continue
+
+                        conditional_text = block + "\n\n" + query
+                        prefix_len_text = block + "\n\n"
+                        prefix_len = self.get_token_length(prefix_len_text, add_special_tokens=True)
+
+                        cond_ppl_result = self.get_ppl(
+                            text=conditional_text,
+                            granularity="line",
+                            condition_mode="prefix",
+                            condition_pos_id=prefix_len - 1
+                        )
+                        ppl_with_context = cond_ppl_result["ppl"]
+
+                        if math.isinf(ppl_with_context):
+                            ppl_change = -float('inf')
+                        else:
+                            ppl_change = query_ppl_without_context - ppl_with_context
+
+                        block_importances.append(ppl_change)
+                        pbar_cond.set_description(f"Func {function_index} Block CondPPL (B{block_idx}: {ppl_change:.2f})")
+
+        elif method == "contrastive_perplexity":
+            # Calculate contrastive PPL importance for each block
+
+            with torch.no_grad():
+                pbar = tqdm(enumerate(chunk_lines), total=len(chunk_lines), desc="Block Contrastive PPL", leave=False)
+                for block_idx, block in pbar:
+                    if not block.strip():
+                        block_importances.append(-float('inf'))
+                        continue
+
+                    # Build context from previous blocks
+                    prev_context = "\n\n".join(chunk_lines[:block_idx]) if block_idx > 0 else ""
+
+                    # 1. PPL(Block | prev_blocks)
+                    regular_ppl_condition = prev_context + "\n\n" if prev_context else None
+                    regular_ppl = self._calculate_perplexity_for_contrastive(block, condition_text=regular_ppl_condition)
+
+                    # 2. PPL(Block | query, prev_blocks)
+                    question_context_parts = [query]
+                    if prev_context:
+                        question_context_parts.append(prev_context)
+                    question_context = "\n\n".join(filter(None, question_context_parts))
+                    cond_ppl_condition = question_context + "\n\n"
+                    cond_ppl = self._calculate_perplexity_for_contrastive(block, condition_text=cond_ppl_condition)
+
+                    # 3. Importance = PPL(Block|prev) - PPL(Block|Q,prev)
+                    if math.isinf(regular_ppl) or math.isinf(cond_ppl):
+                        importance = -float('inf')
+                    else:
+                        importance = regular_ppl - cond_ppl
+
+                    block_importances.append(importance)
+                    pbar.set_description(f"Block {block_idx}: {importance:.2f}")
+                    if torch.cuda.is_available() and (block_idx + 1) % 50 == 0:
+                        torch.cuda.empty_cache()
+
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+
+        return block_importances
+
+    @staticmethod
+    def preserved_blocks(blocks, language="python"):
+        """Apply the historical first-nonempty-line preservation rule."""
+        preserved_block_indices = set()
+        comment_marker = "#" if language.lower() in ["python", "typescript", "rust"] else "//"
+
+        # Find blocks containing function signature
+        for block_idx, block in enumerate(blocks):
+            block_lines = block.split('\n')
+            for line in block_lines:
+                if line.strip():
+                    # Check for function/class definitions
+                    if any(keyword in line for keyword in ['def ', 'class ', 'function ', 'fn ', 'func ']):
+                        preserved_block_indices.add(block_idx)
+                        break
+                    # Check for function-level comments
+                    if line.strip().startswith(comment_marker):
+                        preserved_block_indices.add(block_idx)
+                        break
+                    # Check for return statements
+                    if 'return ' in line:
+                        preserved_block_indices.add(block_idx)
+                        break
+                    break  # Only check first non-empty line of each block
+
+        return preserved_block_indices
+
     def _knapsack_block_selection(
         self,
         blocks: List[str],
         block_importances: List[float],
         target_tokens: int,
         preserved_block_indices: set = None,
-        language: str = "python"
+        language: str = "python",
+        block_value_mode: str = "raw",
     ) -> Tuple[set, Dict]:
         """
         Use knapsack algorithm to select blocks that maximize total importance within token budget.
@@ -1600,9 +1651,12 @@ class LongCodeZip:
             Tuple of (selected_block_indices, selection_info)
         """
         logger.debug(f"Running knapsack block selection with target_tokens={target_tokens}")
+        selection_start = time.monotonic()
         
         if not blocks:
             return set(), {}
+
+        values, normalization = block_values(blocks, block_importances, block_value_mode)
         
         # Calculate token weights for each block
         block_weights = [self.get_token_length(block) for block in blocks]
@@ -1623,13 +1677,16 @@ class LongCodeZip:
             return preserved_block_indices, {
                 "method": "knapsack",
                 "preserved_only": True,
-                "total_value": sum(block_importances[i] for i in preserved_block_indices),
-                "total_weight": preserved_tokens
+                "total_value": sum(values[i] for i in preserved_block_indices),
+                "total_weight": preserved_tokens,
+                "block_values": values, "block_weights": block_weights,
+                "normalization": normalization, "solver": "preserved_only",
+                "selection_seconds": time.monotonic() - selection_start,
             }
         
         # Prepare items for knapsack (excluding preserved blocks)
         knapsack_items = []
-        for i, (weight, value) in enumerate(zip(block_weights, block_importances)):
+        for i, (weight, value) in enumerate(zip(block_weights, values)):
             if i not in preserved_block_indices:
                 # Handle invalid importance scores
                 if math.isnan(value) or math.isinf(value):
@@ -1642,8 +1699,10 @@ class LongCodeZip:
         # Use dynamic programming for exact knapsack solution
         # For efficiency, limit to reasonable problem size
         if len(knapsack_items) <= 100 and remaining_budget <= 2000:
+            solver = "dp"
             selected_indices = self._solve_knapsack_dp(knapsack_items, remaining_budget)
         else:
+            solver = "greedy"
             # Use greedy approximation for large problems
             logger.debug("Using greedy approximation for large knapsack problem")
             selected_indices = self._solve_knapsack_greedy(knapsack_items, remaining_budget)
@@ -1652,7 +1711,7 @@ class LongCodeZip:
         final_selection = preserved_block_indices.union(selected_indices)
         
         # Calculate selection statistics
-        total_value = sum(block_importances[i] for i in final_selection)
+        total_value = sum(values[i] for i in final_selection)
         total_weight = sum(block_weights[i] for i in final_selection)
         
         selection_info = {
@@ -1665,6 +1724,9 @@ class LongCodeZip:
             "target_weight": target_tokens,
             "efficiency": total_value / max(total_weight, 1)
         }
+        selection_info.update(block_values=values, block_weights=block_weights,
+                              normalization=normalization, solver=solver,
+                              selection_seconds=time.monotonic() - selection_start)
         
         logger.debug(f"Knapsack selection: {len(final_selection)}/{len(blocks)} blocks, "
                     f"value={total_value:.2f}, weight={total_weight}/{target_tokens}")
